@@ -22,6 +22,7 @@ from bisect import bisect_right
 from ..perf import read_trace, Branch
 from ..pwn_wrapper import ELF, Coredump
 from ..mapping import Mapping
+from ..rr import RRController
 
 from .state import State, StateManager
 from .hook import all_hookable_symbols, addr_symbols
@@ -297,7 +298,8 @@ class Tracer(object):
                  trace_path,
                  coredump,
                  mappings,
-                 executable_root=None):
+                 executable_root=None, 
+                 **kwargs):
         # type: (str, int, str, str, List[Mapping], Optional[str]) -> None
         self.executable = executable
         self.mappings = mappings
@@ -398,22 +400,41 @@ class Tracer(object):
                     *args,
                     add_options=add_options,
                     remove_options=remove_simplications)
-            rsp, rbp = self.cdanalyzer.stack_base('main')
-            # TODO: or just stop?
-            if not rbp:
-                rbp = 0x7ffffffcf00
-            if not rsp:
-                rsp = 0x7ffffffcf00         
         else:
-            rsp, rbp = self.cdanalyzer.stack_base(self.filter.start_funcname)
-            if not rbp:
-                rbp = 0x7ffffffcf00
-            if not rsp:
-                rsp = 0x7ffffffcf00
             self.start_state = self.project.factory.blank_state(
                 addr=start_address,
                 add_options=add_options,
                 remove_options=remove_simplications)
+
+        self.enable_debugging = True
+
+        if self.enable_debugging:
+            # NOTE: to match stack memory, disabling ASLR is required
+            self.rr = RRController('/home/lrxiao/.local/share/rr/sqlite3-5', self.old_trace)
+
+        if not self.enable_debugging:
+            rsp, rbp = self.cdanalyzer.stack_base(self.filter.start_funcname)
+
+            if not rbp:
+                rbp = 0x7fffffffcf00
+            if not rsp:
+                rsp = 0x7fffffffcf00
+
+        else:
+            l.warning('run until')
+            self.rr.run_until(self.trace_idx[0])
+            l.warning('stop')
+            self.rr.write_request('si')
+            self.rr.clear_output()
+            reg_dict = self.rr.read_reg()
+            rsp = reg_dict.get('rsp', None)
+            rbp = reg_dict.get('rbp', None)
+            while rsp is None:
+                reg_dict = self.rr.read_reg()
+                rsp = reg_dict.get('rsp', None)
+                rbp = reg_dict.get('rbp', None)
+        
+        self.initial_rsp = rsp
 
         if self.filter.is_start_entry:
             self.start_state.regs.rsp = rbp + 8
@@ -422,6 +443,7 @@ class Tracer(object):
             self.start_state.regs.rbp = rbp  
 
         self.setup_argv()
+        self.setup_bss()
         self.simgr = self.project.factory.simgr(
             self.start_state,
             save_unsat=True,
@@ -433,6 +455,15 @@ class Tracer(object):
         # For debugging
         # self.project.pt = self
         self.constraints_index = {} # type: Dict[int, int]
+
+    def setup_bss(self):
+        secs = self.project.loader.main_object.sections
+        for s in secs:
+            if s.name == '.bss':
+                for addr in range(s.min_addr, s.max_addr):
+                    self.start_state.memory.store(
+                        addr, self.start_state.se.BVS('.bss', 8), endness=archinfo.Endness.LE)
+                break
 
     def setup_argv(self):
         # TODO: if argv is modified by users, this won't help
@@ -494,6 +525,48 @@ class Tracer(object):
                 'with length ' + \
                 str(state.inspect.mem_write_length))
             raw_input()
+
+    def check_stack(self, state, old_index):
+        initial_rsp = self.initial_rsp
+        current_rsp = state.se.eval(state.regs.rsp)
+        l.warning('{} : {}'.format(initial_rsp, current_rsp))
+        solver = state.solver._solver.branch()
+        self.rr.run_until(old_index)
+
+        reg_names = [
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9",
+            "r10", "r11", "r12", "r13", "r14", "r15"
+        ]
+
+        reg_dict = self.rr.read_reg()
+        for rn in reg_names:
+            l.warning("Checking reg {}".format(rn))
+            rreg = reg_dict.get(rn, None)
+            if rreg is not None:
+                reg = getattr(state.regs, rn)
+                solver.add(reg == rreg)
+                if not solver.satisfiable():
+                    import ipdb
+                    ipdb.set_trace()
+                    sys.exit(0)
+            else:
+                l.warning('RR error: {}'.format(rn))
+
+        """
+        loc_dict = self.rr.read_addr(current_rsp, initial_rsp - current_rsp)
+        for addr in range(current_rsp, initial_rsp):
+            l.warning("Checking addr {}".format(hex(addr)))
+            rmem = loc_dict.get(addr, None)
+            if rmem is not None:
+                mem = state.memory.load(addr, 1, endness='Iend_LE')
+                solver.add(mem == rmem)
+                if not solver.satisfiable():
+                    import ipdb
+                    ipdb.set_trace()
+                    sys.exit(0)
+            else:
+                l.warning('RR error: {}'.format(addr))
+        """
 
     def test_rep_ins(self, state):
         # NOTE: rep -> sat or unsat
@@ -882,6 +955,11 @@ class Tracer(object):
                 event.ip)
             self.current_branch = event
             old_simstate, new_simstate = self.find_next_branch(simstate, event, cnt)
+
+            if self.enable_debugging:
+                l.warning('check stack')
+                self.check_stack(old_simstate, self.trace_idx[cnt])
+
             simstate = new_simstate
             if cnt % interval == 0 or length - cnt < 15:
                 states.add_major(State(cnt, event, old_simstate, new_simstate))
